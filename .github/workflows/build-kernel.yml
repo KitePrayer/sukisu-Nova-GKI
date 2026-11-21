@@ -148,15 +148,32 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt-get update
+          # 基础必需包，一个不能少，缺了直接失败
           sudo apt-get install -y git curl wget zip unzip lz4 xz-utils \
             build-essential libssl-dev libelf-dev bison flex dwarves \
-            cpio bc kmod python3 python3-pip ccache \
-            libxml2 libncurses5 libncursesw5
-          # libxml2: ZyCromerZ 的 ld.lld 是动态链接的，缺这个会报
-          #          "ld.lld: error while loading shared libraries: libxml2.so.2"
-          #          然后判定为 "unknown linker"，连 defconfig 都过不去。
-          # libncurses5/6: menuconfig 相关工具链依赖，顺带装上。
-          # pahole (dwarves) 旧内核可能不需要，装了不碍事
+            cpio bc kmod python3 python3-pip ccache
+
+          # 运行库：ZyCromerZ 的 ld.lld 是动态链接的，缺 libxml2.so.2 时会报
+          #   "ld.lld: error while loading shared libraries: libxml2.so.2"
+          # 然后被判定为 "unknown linker"，连 defconfig 都过不去。
+          # 注意包名随 Ubuntu 版本变化（26.04 上 libxml2 已无安装候选、
+          # libncurses5 不存在），所以用 apt-cache 现查现装，不硬编码。
+          for pkg in libxml2 libxml2-utils libncurses6 libncursesw6 libtinfo6; do
+            if apt-cache show "$pkg" >/dev/null 2>&1; then
+              echo "[+] 安装 $pkg"
+              sudo apt-get install -y "$pkg" || true
+            else
+              echo "[=] $pkg 在该发行版不存在，跳过"
+            fi
+          done
+
+          # 最终以 ldd 实测为准：如果 ld.lld 仍缺库，这里会明确报出来
+          echo "----- ld.lld 依赖检查 -----"
+          if command -v ld.lld >/dev/null 2>&1; then
+            ld.lld --version || echo "[!] ld.lld 无法运行"
+          else
+            echo "[i] 系统未预装 ld.lld（会用 clang 包自带的）"
+          fi
 
       - name: 配置 ccache
         run: |
@@ -362,6 +379,13 @@ jobs:
           for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
             [ -e "$BINDIR/$t" ] || echo "::warning::缺少 $t"
           done
+
+          # 这个包自带 lib/，先把它加入 LD_LIBRARY_PATH 试试能不能自给自足，
+          # 系统缺 libxml2.so.2 时这是最省事的兜底。
+          for d in "$CDIR/lib" "$CDIR/lib64" "$CDIR/lib/x86_64-linux-gnu"; do
+            [ -d "$d" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          done
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
           # 动态依赖自检：ZyCromerZ 的二进制是动态链接的，
           # 缺库时表现为 "ld.lld: unknown linker" 这种极难定位的报错。
