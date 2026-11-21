@@ -173,7 +173,7 @@ if [ "$DEFPATH" != "arch/arm64/configs/$DEFBASE" ]; then
     cp "$DEFPATH" "arch/arm64/configs/$DEFBASE"
     echo "[+] 已复制到 arch/arm64/configs/$DEFBASE 供 kbuild 使用"
 fi
-make "$DEFBASE"
+timeout 600 make "$DEFBASE" </dev/null
 echo "[+] .config 已生成"
 
 # ---------- 2. 追加 SukiSU Nova 配置 ----------
@@ -268,8 +268,16 @@ if [ -n "${EXTRA_DEFCONFIG:-}" ]; then
     rm -f .config.new
 fi
 
-# 让新增的 CONFIG_ 生效（_MODULE 相关会由 later olddefconfig 解析）
-make olddefconfig >/dev/null 2>&1 || make oldconfig >/dev/null 2>&1 || true
+# 让新增的 CONFIG_ 生效。
+# 绝对不能落到 `make oldconfig`：它会对每个新符号交互式提问，CI 里 stdin
+# 不是 /dev/null 时会一直等输入，表现为「编译跑了一小时没输出、也不失败」。
+# 全部 make 都显式 </dev/null，杜绝任何交互等待。
+echo "[+] 解析 .config（olddefconfig，非交互）"
+if ! make olddefconfig </dev/null 2>&1 | tail -5; then
+    echo "::error::make olddefconfig 失败"
+    exit 1
+fi
+echo "[+] .config 解析完成"
 
 echo "==================== 最终内核配置（KSU 相关） ===================="
 grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPM" .config || true
@@ -296,23 +304,56 @@ if [ "$USE_GCC" = "true" ] && [ -n "$GCC_DIR" ]; then
     fi
 fi
 
-echo "==================== 开始编译 ($MAKE_GOALS) ===================="
-# 按内存自适应并发：内核编译单 job 峰值约 1.5~2G（LTO 更高）。
-# 直接 -j$(nproc) 在 16 核/16G runner 上仍有 OOM 风险，按内存压一下。
+# 按内存自适应并发：单 job 峰值约 1.5~2G（LTO 更高）
 MEM_JOBS=$(( MEM_MB / 2000 ))
-[ "$MEM_JOBS" -lt 1 ] && MEM_JOBS=1
-[ "$MEM_JOBS" -gt "$JOBS" ] && MEM_JOBS=$JOBS
+if [ "$MEM_JOBS" -lt 1 ]; then MEM_JOBS=1; fi
+if [ "$MEM_JOBS" -gt "$JOBS" ]; then MEM_JOBS=$JOBS; fi
 echo "[+] 并发: $MEM_JOBS (nproc=$JOBS, mem=${MEM_MB}MB)"
 
-# 注意：这里临时关掉 pipefail/set -e，否则 make 失败会立即退出，
-# 导致下面的错误日志打印不出来（用户只能看到空失败）
+echo "==================== 编译阶段 1/2: prepare ===================="
+# 先单独跑 prepare。这一步会暴露 Kconfig/工具链层面的问题，
+# 几秒内就能结束，不会像整编那样一跑一小时什么都看不见。
 set +e
+timeout 900 make -j"${MEM_JOBS:-4}" prepare </dev/null 2>&1 | tee /tmp/kernel-prepare.log | tail -20
+RC=${PIPESTATUS[0]}
+set -e
+if [ "$RC" -ne 0 ]; then
+    echo "::error::prepare 阶段失败（退出码 $RC）"
+    tail -40 /tmp/kernel-prepare.log
+    exit "$RC"
+fi
+echo "[+] prepare 通过"
+
+echo "==================== 编译阶段 2/2: $MAKE_GOALS ===================="
+# 后台心跳：每 60 秒打印已运行时长和日志行数，
+# 这样即使 make 卡住，日志里也能看出「停在哪个时间点」。
+# 之前跑了 68 分钟无任何输出，就是因为没有这个。
+START_TS=$(date +%s)
+( while true; do
+    sleep 60
+    if [ -f /tmp/kernel-build.log ]; then
+        printf '[heartbeat] 已编译 %d 分钟，日志 %d 行，最后一条: %s\n' \
+          "$(( $(date +%s) - START_TS ))" \
+          "$(wc -l < /tmp/kernel-build.log 2>/dev/null || echo 0)" \
+          "$(tail -1 /tmp/kernel-build.log 2>/dev/null | cut -c1-100)"
+    fi
+  done ) &
+HB_PID=$!
+
+set +e
+# timeout 兜底：120 分钟还没完说明卡死了，直接杀并打印现场
 # shellcheck disable=SC2086
-make -j"$MEM_JOBS" $MAKE_GOALS 2>&1 | tee /tmp/kernel-build.log
+timeout 7200 make -j"$MEM_JOBS" $MAKE_GOALS </dev/null 2>&1 | tee /tmp/kernel-build.log
 BUILD_RC=${PIPESTATUS[0]}
 set -e
+kill "$HB_PID" 2>/dev/null || true
+
 if [ "$BUILD_RC" -ne 0 ]; then
     echo "::error::内核编译失败（退出码 $BUILD_RC）"
+    if [ "$BUILD_RC" -eq 124 ]; then
+        echo "::error::编译超过 120 分钟被 timeout 终止，最后进度："
+    fi
+    echo "----- 日志行数: $(wc -l < /tmp/kernel-build.log 2>/dev/null || echo 0) -----"
     echo "----- 错误摘要 -----"
     grep -nE 'error:|Error [0-9]|fatal error|undefined reference|Killed|out of memory|cannot find' \
         /tmp/kernel-build.log | tail -25 || true
@@ -320,11 +361,12 @@ if [ "$BUILD_RC" -ne 0 ]; then
     tail -60 /tmp/kernel-build.log
     exit "$BUILD_RC"
 fi
+echo "[+] 编译完成，用时 $(( $(date +%s) - START_TS )) 秒"
 
 # 尝试生成压缩镜像（可选，不阻塞）
 echo "[+] 尝试生成 Image.gz / Image.lz4 ..."
-make -j$(nproc) Image.gz >/dev/null 2>&1 || true
-command -v lz4 >/dev/null 2>&1 && make -j$(nproc) Image.lz4 >/dev/null 2>&1 || true
+timeout 600 make -j"$(nproc)" Image.gz </dev/null >/dev/null 2>&1 || true
+if command -v lz4 >/dev/null 2>&1; then timeout 600 make -j"$(nproc)" Image.lz4 </dev/null >/dev/null 2>&1 || true; fi
 
 # ---------- 4. 定位与收集产物 ----------
 IMG_DIR=""
