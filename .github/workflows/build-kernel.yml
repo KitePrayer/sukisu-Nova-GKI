@@ -158,21 +158,40 @@ jobs:
           # 然后被判定为 "unknown linker"，连 defconfig 都过不去。
           # 注意包名随 Ubuntu 版本变化（26.04 上 libxml2 已无安装候选、
           # libncurses5 不存在），所以用 apt-cache 现查现装，不硬编码。
-          for pkg in libxml2 libxml2-utils libncurses6 libncursesw6 libtinfo6; do
-            if apt-cache show "$pkg" >/dev/null 2>&1; then
-              echo "[+] 安装 $pkg"
-              sudo apt-get install -y "$pkg" || true
-            else
-              echo "[=] $pkg 在该发行版不存在，跳过"
-            fi
+          # 不猜包名：用 apt-file 风格的「哪个包提供这个 .so」来定位。
+          # 26.04 上 libxml2 已无安装候选、libxml2-utils 只有工具不含库，
+          # 直接按名字装会静默跳过，最后在编译期炸掉。
+          echo "----- 定位 libxml2.so.2 的提供者 -----"
+          sudo apt-get install -y apt-file >/dev/null 2>&1 || true
+          sudo apt-file update >/dev/null 2>&1 || true
+          PKG=$(apt-file search "libxml2.so.2" 2>/dev/null \
+                | grep -E 'libxml2[^:]*: ' | head -1 | cut -d: -f1)
+          if [ -n "$PKG" ]; then
+            echo "[+] libxml2.so.2 由 $PKG 提供"
+            sudo apt-get install -y "$PKG" || true
+          else
+            echo "[!] apt-file 未定位到，尝试候选包名"
+            for pkg in libxml2-16 libxml2-2 libxml2 libxml2-16t64; do
+              if apt-cache show "$pkg" >/dev/null 2>&1; then
+                echo "    安装 $pkg"
+                sudo apt-get install -y "$pkg" || true
+                break
+              fi
+            done
+          fi
+
+          # 其余通用运行库
+          for pkg in libncurses6 libncursesw6 libtinfo6 zlib1g; do
+            apt-cache show "$pkg" >/dev/null 2>&1 && sudo apt-get install -y "$pkg" || true
           done
 
-          # 最终以 ldd 实测为准：如果 ld.lld 仍缺库，这里会明确报出来
-          echo "----- ld.lld 依赖检查 -----"
-          if command -v ld.lld >/dev/null 2>&1; then
-            ld.lld --version || echo "[!] ld.lld 无法运行"
+          # 最终实测：能不能找到 libxml2.so.2
+          echo "----- libxml2 检查 -----"
+          if ldconfig -p 2>/dev/null | grep -q 'libxml2.so.2'; then
+            echo "[+] 系统已有 libxml2.so.2"
+            ldconfig -p | grep 'libxml2.so.2' | head -2
           else
-            echo "[i] 系统未预装 ld.lld（会用 clang 包自带的）"
+            echo "[!] 系统仍缺 libxml2.so.2，将依赖 clang 包自带的 lib/"
           fi
 
       - name: 配置 ccache
@@ -382,10 +401,17 @@ jobs:
 
           # 这个包自带 lib/，先把它加入 LD_LIBRARY_PATH 试试能不能自给自足，
           # 系统缺 libxml2.so.2 时这是最省事的兜底。
+          # 注意 set -e：必须用 if 而不是 [ -d ] && ...，否则目录不存在时整步退出
+          LDIRS=""
           for d in "$CDIR/lib" "$CDIR/lib64" "$CDIR/lib/x86_64-linux-gnu"; do
-            [ -d "$d" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            if [ -d "$d" ]; then
+              LDIRS="${LDIRS:+$LDIRS:}$d"
+              echo "[+] 加入库搜索路径: $d"
+            fi
           done
-          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          if [ -n "$LDIRS" ]; then
+            echo "LD_LIBRARY_PATH=$LDIRS" >> $GITHUB_ENV
+          fi
 
           # 动态依赖自检：ZyCromerZ 的二进制是动态链接的，
           # 缺库时表现为 "ld.lld: unknown linker" 这种极难定位的报错。
@@ -442,6 +468,7 @@ jobs:
           DEFCONFIG_PATH: ${{ inputs.defconfig_path }}
           CLANG_DIR: ${{ env.CLANG_DIR }}
           CLANG_BIN_DIR: ${{ env.CLANG_BIN_DIR }}
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
           USE_GCC: ${{ inputs.use_gcc }}
           GCC_DIR: ${{ env.GCC_DIR }}
           KSU_AS_MODULE: ${{ inputs.ksu_as_module }}
