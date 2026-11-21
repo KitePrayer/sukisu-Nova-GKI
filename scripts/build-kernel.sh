@@ -41,27 +41,35 @@ nproc
 
 # ---------- 0. 工具链路径 ----------
 export ARCH=arm64
-CLANG_PATH=""
-if [ -n "$CLANG_DIR" ]; then
-    CLANG_PATH="$CLANG_DIR/bin"
-    export PATH="$CLANG_PATH:$PATH"
+# CLANG_BIN_DIR 是真正包含 clang / ld.lld / llvm-ar 的目录；
+# 旧写法假定它是 $CLANG_DIR/bin，但解压包布局不一定是那样。
+CLANG_BIN_DIR="${CLANG_BIN_DIR:-}"
+if [ -z "$CLANG_BIN_DIR" ] && [ -n "${CLANG_DIR:-}" ]; then
+    CLANG_BIN_DIR="$CLANG_DIR/bin"
+fi
+if [ -n "$CLANG_BIN_DIR" ] && [ -x "$CLANG_BIN_DIR/clang" ]; then
+    export PATH="$CLANG_BIN_DIR:$PATH"
+    echo "[+] clang bin 目录: $CLANG_BIN_DIR"
+else
+    echo "::warning::CLANG_BIN_DIR 未设置或其中没有 clang: '$CLANG_BIN_DIR'"
 fi
 
 # 编译器选择：
-#   有 clang  -> clang 编译（主流，兼容 GCC/LLVM 两套）
+#   有 clang  -> clang 编译（GKI 内核的唯一可行路径，LTO/CFI 都依赖 clang）
 #   无 clang  -> 回退 GCC（仅当 USE_GCC=true 且提供 GCC_DIR）
-# LLVM=1 让 kbuild 用 clang 全套工具（llvm-ar/llvm-nm…），AOSP clang 自带
-if [ -n "$CLANG_PATH" ] && [ -x "$CLANG_PATH/clang" ]; then
+# LLVM=1 让 kbuild 用 clang 全套工具（llvm-ar/llvm-nm/ld.lld）
+# 注意：clang 往往是符号链接，必须用 -x 而不是 -f 判断
+if [ -n "$CLANG_BIN_DIR" ] && [ -x "$CLANG_BIN_DIR/clang" ]; then
     export CC=clang
     export LLVM=1
-    echo "[+] 编译器: AOSP clang ($CLANG_PATH)"
+    echo "[+] 编译器: $("$CLANG_BIN_DIR/clang" --version | head -1)"
 else
     export LLVM=0
     if [ "$USE_GCC" = "true" ] && [ -n "$GCC_DIR" ] && [ -x "$GCC_DIR/bin/aarch64-linux-gnu-gcc" ]; then
         export CC="$GCC_DIR/bin/aarch64-linux-gnu-gcc"
         echo "[+] 编译器: GCC ($CC)"
     else
-        echo "::error::没有可用编译器（需要 CLANG_DIR 或 USE_GCC + GCC_DIR）"
+        echo "::error::没有可用编译器（需要 CLANG_BIN_DIR 里有 clang，或 USE_GCC + GCC_DIR）"
         exit 1
     fi
 fi

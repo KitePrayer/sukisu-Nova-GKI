@@ -275,95 +275,80 @@ jobs:
           KROOT: ${{ env.KROOT }}
         run: |
           set -e
-          # 优先用内核源码 build.config.constants 里声明的 CLANG_VERSION。
-          # GKI 内核的 LTO / CFI / MODVERSIONS / BTF 对 clang 版本敏感，
-          # 用错版本即使能编出来，KMI 也可能对不上，所以不自己拍版本号。
+          # 读内核声明的 CLANG_VERSION 只用于「报告是否匹配」，不再拿它拼 URL。
+          # AOSP prebuilts 是 LFS 仓库，+archive 对子目录返回 400，git clone 单目录
+          # 又要先拿完整索引，在 runner 上不划算。ZyCromerZ 的包是完整 tar.gz、
+          # GitHub release 直链，稳定可用，也是社区内核 Action 的通行做法。
           WANT=""
-          if [ -n "${CLANG_OVERRIDE}" ]; then
-            WANT="$CLANG_OVERRIDE"
-            echo "[+] 用户指定 clang: $WANT"
-          elif [ -f "$KROOT/build.config.constants" ]; then
+          if [ -f "$KROOT/build.config.constants" ]; then
             WANT=$(grep -oE 'CLANG_VERSION=[A-Za-z0-9._-]+' "$KROOT/build.config.constants" \
                    | head -1 | cut -d= -f2)
-            echo "[+] 从 build.config.constants 读到 CLANG_VERSION: ${WANT:-<空>}"
+            echo "[+] 内核声明 CLANG_VERSION: ${WANT:-未声明}"
           fi
 
-          # 统一成一个「解压后找得到 bin/clang」的方式
-          probe_and_set() {
-            # $1 = 解压根目录
-            local root="$1"
-            local c
-            c=$(find "$root" -maxdepth 3 -type f -name clang -path '*/bin/*' 2>/dev/null | head -1)
-            if [ -z "$c" ]; then
-              echo "::error::解压后未找到 bin/clang，目录顶部："
-              ls -la "$root" | head -20
-              return 1
-            fi
-            local dir; dir="$(dirname "$c")"
-            chmod -R +x "$dir" 2>/dev/null || true
-            "$dir/clang" --version | head -1
-            echo "CLANG_DIR=$(dirname "$dir")" >> $GITHUB_ENV
-            echo "[+] CLANG_DIR=$(dirname "$dir")"
-          }
-
-          try_aosp() {
-            local ver="$1"
-            local url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${ver}.tar.gz"
-            echo "[+] 尝试 AOSP prebuilts: $ver"
-            # +archive 直出目录 tar（无 LFS 指针、无外层 wrapper 目录）
-            if ! curl -fsSL --retry 2 --max-time 600 "$url" -o clang.tgz; then
-              echo "[!] AOSP 下载失败"
-              return 1
-            fi
-            rm -rf clang && mkdir -p clang
-            if ! tar -xzf clang.tgz -C clang --strip-components=0 2>/dev/null; then
-              echo "[!] AOSP 包解压失败"
-              return 1
-            fi
-            probe_and_set clang
-          }
-
-          try_zyc() {
-            local tag="$1"
-            echo "[+] 回退 ZyCromerZ/Clang: $tag"
-            local api="https://api.github.com/repos/ZyCromerZ/Clang/releases/tags/$tag"
-            local url
-            url=$(curl -sL --retry 3 --max-time 120 "$api" | python3 -c \
-                  "import json,sys;d=json.load(sys.stdin);a=d.get('assets') or [];print(a[0]['browser_download_url'] if a else '')")
-            if [ -z "$url" ]; then echo "[!] 解析不到下载地址"; return 1; fi
-            echo "    下载: $url"
-            if ! wget -q --timeout=600 "$url" -O clang.tgz; then echo "[!] 下载失败"; return 1; fi
-            rm -rf clang && mkdir -p clang
-            # 注意：这个包顶层是 README.md + aarch64-linux-gnu/，没有 wrapper 目录，
-            # 所以不能 --strip-components，否则 bin/clang 会被剥错位。
-            if ! tar -xzf clang.tgz -C clang 2>/dev/null; then echo "[!] 解压失败"; return 1; fi
-            probe_and_set clang
-          }
-
-          ok=0
-          if [ -n "$WANT" ]; then
-            case "$WANT" in
-              clang-*)  try_aosp "$WANT" && ok=1 || true ;;
-              [0-9]*)   try_zyc  "$WANT" && ok=1 || true ;;
-              *)        try_aosp "$WANT" && ok=1 || true ;;
-            esac
+          TAG="$CLANG_OVERRIDE"
+          if [ -z "$TAG" ]; then
+            TAG="15.0.7-20260208-release"
           fi
-          # 兜底：AOSP 取不到就退 ZyCromerZ 的稳定版
-          if [ "$ok" -eq 0 ]; then
-            echo "::warning::首选 clang 获取失败，回退 ZyCromerZ 15.0.7"
-            try_zyc "15.0.7-20260208-release" && ok=1 || true
+          echo "[+] 使用 ZyCromerZ/Clang: $TAG"
+
+          API="https://api.github.com/repos/ZyCromerZ/Clang/releases/tags/$TAG"
+          URL=$(curl -sL --retry 3 --max-time 120 "$API" | python3 -c \
+                "import json,sys;d=json.load(sys.stdin);a=d.get('assets') or [];print(a[0]['browser_download_url'] if a else '')")
+          if [ -z "$URL" ]; then
+            echo "::error::解析不到 $TAG 的下载地址"
+            curl -sL "$API" | head -5
+            exit 1
           fi
-          if [ "$ok" -eq 0 ]; then
-            echo "::error::所有 clang 来源都失败"
+          echo "    下载: $URL"
+          wget -q --timeout=900 "$URL" -O clang.tar.gz
+
+          # 这个包顶层是 README.md + aarch64-linux-gnu/ + bin/ + lib/ 等，
+          # 没有外层 wrapper 目录，所以不能 --strip-components。
+          rm -rf "$GITHUB_WORKSPACE/clang"
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+          tar -xzf clang.tar.gz -C "$GITHUB_WORKSPACE/clang"
+          rm -f clang.tar.gz
+
+          CDIR="$GITHUB_WORKSPACE/clang"
+          echo "----- 解压后顶层 -----"
+          ls -1 "$CDIR"
+
+          # 关键：clang 常常是指向 clang-XX 的符号链接，find 不能加 -type f，
+          # 否则会把符号链接过滤掉（这正是上一版失败的原因）。
+          CLANG_BIN=$(find "$CDIR" -maxdepth 4 -name clang -path '*/bin/*' 2>/dev/null | head -1)
+          if [ -z "$CLANG_BIN" ]; then
+            echo "[!] 没找到 bin/clang，尝试从 clang-<数字> 建软链"
+            REAL=$(find "$CDIR" -maxdepth 4 -type f -name 'clang-[0-9]*' -path '*/bin/*' 2>/dev/null | head -1)
+            if [ -n "$REAL" ]; then
+              ln -sf "$(basename "$REAL")" "$(dirname "$REAL")/clang"
+              CLANG_BIN="$(dirname "$REAL")/clang"
+            fi
+          fi
+          if [ -z "$CLANG_BIN" ]; then
+            echo "::error::包里找不到 clang 可执行文件"
+            echo "----- bin 目录内容 -----"
+            find "$CDIR" -maxdepth 3 -path '*/bin/*' 2>/dev/null | head -30
             exit 1
           fi
 
-          # 版本是否与内核声明一致（只警告，不阻断）
+          BINDIR=$(dirname "$CLANG_BIN")
+          chmod -R +x "$BINDIR" 2>/dev/null || true
+          echo "[+] clang 路径: $CLANG_BIN"
+          "$CLANG_BIN" --version | head -2
+
+          # LLVM 工具集（llvm-ar / llvm-nm / ld.lld）必须同一个 bin 目录，
+          # 否则 kbuild 的 LLVM=1 会去找系统里不存在的工具
+          for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
+            [ -e "$BINDIR/$t" ] || echo "::warning::缺少 $t"
+          done
+
+          echo "CLANG_DIR=$CDIR" >> $GITHUB_ENV
+          echo "CLANG_BIN_DIR=$BINDIR" >> $GITHUB_ENV
+          echo "[+] CLANG_DIR=$CDIR"
           if [ -n "$WANT" ]; then
-            echo "[+] 期望 clang: $WANT"
-            echo "[+] 实际 clang: $("$(grep '^CLANG_DIR=' $GITHUB_ENV | tail -1 | cut -d= -f2-)"/bin/clang --version 2>/dev/null | head -1 || echo 未知)"
+            echo "[i] 内核声明 $WANT，实际使用 $($CLANG_BIN --version | head -1)"
           fi
-          rm -f clang.tgz
 
       - name: 下载 GCC 交叉编译器
         if: ${{ inputs.use_gcc }}
@@ -389,6 +374,7 @@ jobs:
           DEFCONFIG: ${{ env.DEFCONFIG }}
           DEFCONFIG_PATH: ${{ inputs.defconfig_path }}
           CLANG_DIR: ${{ env.CLANG_DIR }}
+          CLANG_BIN_DIR: ${{ env.CLANG_BIN_DIR }}
           USE_GCC: ${{ inputs.use_gcc }}
           GCC_DIR: ${{ env.GCC_DIR }}
           KSU_AS_MODULE: ${{ inputs.ksu_as_module }}
