@@ -217,70 +217,51 @@ if ! { set +o pipefail; yes "" | make olddefconfig > /tmp/_olddef1.log 2>&1; }; 
 fi
 tail -3 /tmp/_olddef1.log
 
-# 统一的配置写入函数：
-# 用 scripts/config 而不是直接 sed .config，因为它能正确处理
-# 「# CONFIG_X is not set」形式，也不会写出重复行。
-# scripts/config 是内核自带脚本，必须存在
-if [ ! -x scripts/config ]; then
-    echo "[!] scripts/config 不存在，现场编译"
-    make -s scripts >/dev/null 2>&1 || true
-fi
-KCONF="./scripts/config"
-echo "[+] pwd=$(pwd)"
-echo "[+] KCONF=$KCONF  存在=$([ -x "$KCONF" ] && echo yes || echo no)"
-echo "[+] .config 行数=$(wc -l < .config 2>/dev/null || echo 0)"
-echo "[+] .config 里改之前的 KSU/KPM："
-grep -E '^CONFIG_KSU|^# CONFIG_KSU|^CONFIG_KPM|^# CONFIG_KPM' .config 2>/dev/null | head -5 || echo "    <无>"
-if [ ! -x "$KCONF" ]; then
-    echo "::error::scripts/config 不可用，无法安全修改 .config"
-    exit 1
-fi
+# 配置写入：不再依赖 scripts/config，也不做任何 kconfig 解析。
+# 原因：scripts/config 在 CI 上执行结果不可观测（日志里连回显都没有），
+# 而 ENABLE_XXX=y 这种行本身对 kbuild 就是合法的，直接写 .config 即可。
+# kbuild 在编译时会用 .config 里的值，不会因为「没经过 olddefconfig」而失效。
+KCONF_APPLIED=/tmp/_ksu_applied.txt
+: > "$KCONF_APPLIED"
 
-kconf() {
-    # $1=操作(--enable/--disable/--set-val) $2=符号名（不带 CONFIG_ 前缀）
-    local op="$1" sym="$2" val="${3:-}"
-    case "$op" in
-        --set-val) "$KCONF" --set-val "$sym" "$val" ;;
-        *)         "$KCONF" "$op" "$sym" ;;
-    esac
-    local rc=$?
-    # 每次改完立刻回读，任何一步没写上都能在日志里定位
-    local after
-    after=$(grep -E "^CONFIG_${sym}=" .config 2>/dev/null | head -1)
-    if [ -z "$after" ]; then
-        after=$(grep -E "^# CONFIG_${sym} is not set" .config 2>/dev/null | head -1)
+# 写入单个配置项：先删同名旧行（含 is not set 形式），再追加
+put_conf() {
+    local sym="$1" val="$2"
+    sed -i "/^CONFIG_${sym}=/d; /^# CONFIG_${sym} is not set/d" .config
+    if [ "$val" = "n" ]; then
+        # bool/tristate 的「关闭」在 .config 里的规范写法是注释形式，
+        # 写成 CONFIG_X=n 虽然 kbuild 也认，但会触发 syncconfig 重写，
+        # 保险起见用标准形式
+        echo "# CONFIG_${sym} is not set" >> .config
+        echo "# CONFIG_${sym} is not set" >> "$KCONF_APPLIED"
+    else
+        echo "CONFIG_${sym}=${val}" >> .config
+        echo "CONFIG_${sym}=${val}" >> "$KCONF_APPLIED"
     fi
-    echo "    [config] ${op} ${sym}${val:+=$val} -> rc=$rc 现为: ${after:-<无此行>}"
-    return $rc
 }
 
 # ---------- 2.1 CONFIG_HZ ----------
 # 必须显式设置。内核生成 include/generated/timeconst.h 用：
 #     filechk_gentimeconst = echo $(CONFIG_HZ) | bc -q kernel/time/timeconst.bc
-# CONFIG_HZ 为空时 `echo | bc` 拿到空输入，bc 报 "bad expression"，
-# filechk 因输出不匹配而反复重试，表现为 prepare 阶段无限挂起。
-# 已用真实 timeconst.bc 实测：250 正常产出，空值报错。
-if ! grep -q '^CONFIG_HZ=' .config; then
+# CONFIG_HZ 为空时 bc 拿到空输入，filechk 因输出不匹配反复重试，
+# 表现为 prepare 阶段挂死（run #12/#14 各挂满 30 分钟被 timeout 杀掉）。
+if grep -q '^CONFIG_HZ=' .config; then
+    echo "[=] .config 已有 CONFIG_HZ，保持原值"
+else
     echo "[+] 补充 CONFIG_HZ=250（原 defconfig 未定义，会导致 timeconst 生成挂起）"
+    put_conf HZ 250
 fi
-# 只需设 HZ 的值，HZ_250/HZ_100 由 arch Kconfig 的 choice 自动推导，
-# 手动 enable HZ_250 反而可能与 HZ 冲突
-kconf --set-val HZ 250
 
 # ---------- 2.2 KernelSU ----------
-kconf --enable KPROBES
-kconf --enable EXT4_FS
-if [ "$KSU_MODE" = "m" ]; then
-    kconf --module KSU
-else
-    kconf --enable KSU
-fi
+put_conf KPROBES y
+put_conf EXT4_FS y
+put_conf KSU "$KSU_MODE"
 
 if [ "$ENABLE_KPM" = "true" ]; then
-    kconf --enable KPM
+    put_conf KPM y
     if [ "$KSU_MODE" = "y" ]; then
-        kconf --enable KALLSYMS
-        kconf --enable KALLSYMS_ALL
+        put_conf KALLSYMS y
+        put_conf KALLSYMS_ALL y
     fi
 fi
 
@@ -290,17 +271,17 @@ LTO_MODE="${LTO_MODE:-thin}"
 echo "[+] LTO 模式: $LTO_MODE"
 case "$LTO_MODE" in
     full)
-        kconf --enable LTO_CLANG_FULL
-        kconf --disable LTO_CLANG_THIN
+        put_conf LTO_CLANG_FULL y
+        put_conf LTO_CLANG_THIN n
         ;;
     thin)
-        kconf --disable LTO_CLANG_FULL
-        kconf --enable LTO_CLANG_THIN
+        put_conf LTO_CLANG_FULL n
+        put_conf LTO_CLANG_THIN y
         ;;
     none)
-        kconf --disable LTO_CLANG_FULL
-        kconf --disable LTO_CLANG_THIN
-        kconf --disable CFI_CLANG
+        put_conf LTO_CLANG_FULL n
+        put_conf LTO_CLANG_THIN n
+        put_conf CFI_CLANG n
         echo "[!] 已关闭 LTO，同时关闭 CFI_CLANG（CFI 依赖 LTO）"
         ;;
 esac
@@ -311,13 +292,13 @@ if [ "$BTF_MODE" = "on" ]; then
     echo "[+] 保留 DEBUG_INFO_BTF"
     command -v pahole >/dev/null 2>&1 && pahole --version || echo "::warning::未找到 pahole"
 else
-    kconf --disable DEBUG_INFO_BTF
-    kconf --disable DEBUG_INFO_BTF_MODULES
+    put_conf DEBUG_INFO_BTF n
+    put_conf DEBUG_INFO_BTF_MODULES n
     echo "[+] 已关闭 DEBUG_INFO_BTF（避免 pahole 版本不匹配中断编译）"
 fi
 
 # ---------- 2.5 模块签名 ----------
-kconf --disable MODULE_SIG
+put_conf MODULE_SIG n
 echo "[+] 已关闭 MODULE_SIG（自编内核无签名链）"
 
 # ---------- 2.6 用户自定义 ----------
@@ -355,31 +336,19 @@ else
     echo "::warning::CONFIG_KSU 行格式异常"
 fi
 
-echo "==================== 最终内核配置 ===================="
-for k in CONFIG_MODULES CONFIG_KSU CONFIG_KPROBES CONFIG_EXT4_FS CONFIG_KPM \
-         CONFIG_HZ CONFIG_LTO_CLANG_THIN CONFIG_LTO_CLANG_FULL \
-         CONFIG_CFI_CLANG CONFIG_DEBUG_INFO_BTF CONFIG_MODULE_SIG; do
-    v=$(grep -E "^${k}=" .config 2>/dev/null | head -1 || true)
-    if [ -z "$v" ]; then
-        v=$(grep -E "^# ${k} is not set" .config 2>/dev/null | head -1 || true)
-    fi
-    echo "  ${k} = ${v:-<缺失>}"
-done
-# 同时写进 Step Summary，GitHub 页面上能直接看到，不会被日志折叠
-{
-    echo "## 内核配置"
-    echo ""
-    echo "| 项 | 值 |"
-    echo "|---|---|"
-    for k in CONFIG_MODULES CONFIG_KSU CONFIG_KPM CONFIG_HZ CONFIG_LTO_CLANG_THIN \
-             CONFIG_CFI_CLANG CONFIG_DEBUG_INFO_BTF; do
-        v=$(grep -E "^${k}=" .config 2>/dev/null | head -1 | cut -d= -f2- || true)
-        if [ -z "$v" ]; then
-            v=$(grep -qE "^# ${k} is not set" .config 2>/dev/null && echo "n" || echo "缺失")
-        fi
-        echo "| $k | $v |"
-    done
-} >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+echo "==================== 配置写入结果 ===================="
+echo "--- 本次 put_conf 写入的记录 ---"
+cat "$KCONF_APPLIED" 2>/dev/null || echo "  <空>"
+echo "--- .config 中实际存在的相关项（直接 grep 文件，不经管道）---"
+grep -E '^CONFIG_(MODULES|KSU|KPROBES|EXT4_FS|KPM|HZ|KALLSYMS|KALLSYMS_ALL|LTO_CLANG_THIN|LTO_CLANG_FULL|CFI_CLANG|DEBUG_INFO_BTF|MODULE_SIG)=' .config > /tmp/_ksu_final.txt 2>/dev/null || true
+if [ -s /tmp/_ksu_final.txt ]; then
+    cat /tmp/_ksu_final.txt
+else
+    echo "  <一个都没有，说明 .config 异常>"
+fi
+echo "--- 上述项的 is-not-set 形式 ---"
+grep -E '^# CONFIG_(KSU|KPM|LTO_CLANG_FULL|DEBUG_INFO_BTF|MODULE_SIG) is not set' .config 2>/dev/null || echo "  <无>"
+echo "--- .config 总行数: $(wc -l < .config) ---"
 
 # KSU 必须真的进了 .config，否则编出来是普通内核
 if ! grep -qE '^CONFIG_KSU=[ym]' .config; then
