@@ -292,16 +292,31 @@ jobs:
           fi
           echo "[+] 使用 ZyCromerZ/Clang: $TAG"
 
-          API="https://api.github.com/repos/ZyCromerZ/Clang/releases/tags/$TAG"
-          URL=$(curl -sL --retry 3 --max-time 120 "$API" | python3 -c \
-                "import json,sys;d=json.load(sys.stdin);a=d.get('assets') or [];print(a[0]['browser_download_url'] if a else '')")
-          if [ -z "$URL" ]; then
-            echo "::error::解析不到 $TAG 的下载地址"
-            curl -sL "$API" | head -5
+          # 不查 api.github.com：runner 是共享出口 IP，未认证配额 60/h，
+          # 同一 IP 上其它构建很容易把它耗尽（run #4 就是这么失败的）。
+          # 该仓库 tag 与文件名的映射是稳定的：tag "X-release" -> "Clang-X.tar.gz"
+          # 已核对 14/15/16/23 四个版本全部吻合。
+          BASE="https://github.com/ZyCromerZ/Clang/releases/download/$TAG"
+          ASSET="Clang-${TAG%-release}.tar.gz"
+          URL="$BASE/$ASSET"
+
+          # 用 HEAD 探测存在性，不消耗 API 配额
+          code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 60 "$URL" || echo 000)
+          echo "    探测: $URL -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            # tag 可能本身不带 -release 后缀，退一步试原样
+            URL="$BASE/Clang-${TAG}.tar.gz"
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 60 "$URL" || echo 000)
+            echo "    重试: $URL -> HTTP $code"
+          fi
+          if [ "$code" != "200" ]; then
+            echo "::error::下载地址不可用（HTTP $code）"
+            echo "        tag=$TAG"
+            echo "        请在 https://github.com/ZyCromerZ/Clang/releases 确认 tag 名"
             exit 1
           fi
           echo "    下载: $URL"
-          wget -q --timeout=900 "$URL" -O clang.tar.gz
+          wget -q --timeout=900 --tries=3 "$URL" -O clang.tar.gz
 
           # 这个包顶层是 README.md + aarch64-linux-gnu/ + bin/ + lib/ 等，
           # 没有外层 wrapper 目录，所以不能 --strip-components。
