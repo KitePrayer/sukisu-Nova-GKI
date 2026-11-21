@@ -1,0 +1,275 @@
+# =====================================================================
+# SukiSU Nova 自定义内核构建工作流
+# ---------------------------------------------------------------------
+# 在 GitHub Actions 上编译「你自己指定源码链接」的 Android 内核，
+# 并集成 SukiSU Nova（官改版 KernelSU）。
+#
+# 用法：
+#   1. fork 本仓库
+#   2. Actions -> Build Kernel -> Run workflow
+#   3. 填写源码链接、分支、defconfig、工具链等参数
+#   4. 产物（boot.img / AnyKernel3.zip / Image）在 Artifacts 里下载
+#
+# 设计参考 moemoli/GKI_KernelSU_SUSFS 的 build.yml，但做了三点关键改造：
+#   A. 内核源码 URL/分支/子目录/defconfig 全部由 workflow 输入参数指定
+#      （支持 GKI 与非 GKI、官方与第三方源码）
+#   B. 集成的是 SukiSU-Nova/SukiSU-Nova（新仓库，含 NyaZygisk），
+#      而非旧仓库 SukiSU-Ultra
+#   C. 绕开 Nova setup.sh 里 git.zako.shirkneko.top:20004 这个
+#      非标准端口镜像源（Actions 网络拉不动），直接 clone GitHub 仓库
+#      并手工做等价集成（软链 drivers/kernelsu + Makefile/Kconfig 条目）
+# =====================================================================
+
+name: Build Kernel (SukiSU Nova)
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ---------------- 内核源码（自定义链接入口） ----------------
+      kernel_source_url:
+        description: "内核源码 git 地址 (如 https://github.com/xxx/android_kernel_xxx.git)"
+        required: true
+        type: string
+      kernel_source_branch:
+        description: "源码分支/tag/commit (如 lineage-21, 12.1, abcd1234)"
+        required: true
+        type: string
+        default: "main"
+      kernel_source_dir:
+        description: "内核源码在仓库中的子目录 (如 kernel/ 或 common/；根目录留空)"
+        required: false
+        type: string
+        default: ""
+      defconfig:
+        description: "defconfig 名 (如 gki_defconfig / vendor_defconfig，不含路径)"
+        required: true
+        type: string
+        default: "gki_defconfig"
+      defconfig_path:
+        description: "defconfig 所在目录 (默认 arch/arm64/configs，留空自动)"
+        required: false
+        type: string
+        default: ""
+
+      # ---------------- SukiSU Nova 配置 ----------------
+      nova_source:
+        description: "Nova 仓库 (默认官方 SukiSU-Nova/SukiSU-Nova；可改 fork)"
+        required: false
+        type: string
+        default: "SukiSU-Nova/SukiSU-Nova"
+      nova_branch:
+        description: "Nova 分支: main(GKI/kprobe) 或 builtin(手动hook)"
+        required: false
+        type: string
+        default: "main"
+      nova_ref:
+        description: "Nova 版本/tag/commit (留空 = 分支最新)"
+        required: false
+        type: string
+        default: ""
+
+      # ---------------- 内核选项 ----------------
+      enable_kpm:
+        description: "启用 KPM (CONFIG_KPM=y，需 64 位，可能影响稳定性)"
+        required: false
+        type: boolean
+        default: false
+      ksu_as_module:
+        description: "CONFIG_KSU=m 编译成模块 (GKI LKM 用)；关=内置 y"
+        required: false
+        type: boolean
+        default: false
+      extra_defconfig:
+        description: "追加到 defconfig 的额外配置行 (用 | 分隔多行)"
+        required: false
+        type: string
+        default: ""
+
+      # ---------------- 工具链 ----------------
+      toolchain_clang:
+        description: "Clang 版本号 (ZyCromerZ/Clang release tag，如 15.0.7-20260208-release；留空用默认)"
+        required: false
+        type: string
+        default: ""
+      use_gcc:
+        description: "同时使用 GCC 交叉编译器 (老内核/厂商源码需要 CROSS_COMPILE)"
+        required: false
+        type: boolean
+        default: false
+      gcc_url:
+        description: "GCC 交叉编译器 git 地址 (默认 LineageOS aarch64 6.4.1)"
+        required: false
+        type: string
+        default: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git"
+
+      # ---------------- 产物 ----------------
+      pack_anykernel:
+        description: "打包 AnyKernel3 刷机包 (把 Image 塞进 TWRP 可刷的 zip)"
+        required: false
+        type: boolean
+        default: true
+      anykernel_repo:
+        description: "AnyKernel3 模板仓库 (GKI 内核可用 WildKernels/AnyKernel3 的 gki-2.0 分支)"
+        required: false
+        type: string
+        default: "https://github.com/osm0sis/AnyKernel3.git"
+      release_tag:
+        description: "发布到 GitHub Release 的 tag (留空=只传 Artifact)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: 检出构建脚本
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl wget zip unzip lz4 xz-utils \
+            build-essential libssl-dev libelf-dev bison flex dwarves \
+            cpio bc kmod python3 python3-pip ccache
+          # pahole (dwarves) 旧内核可能不需要，装了不碍事
+
+      - name: 配置 ccache
+        run: |
+          ccache --max-size=2G
+          ccache --set-config=compression=true
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: |
+            ccache-
+
+      # ---------- 1. 下载 SukiSU Nova ----------
+      - name: 克隆 SukiSU Nova
+        run: |
+          set -e
+          git clone --depth 1 \
+            https://github.com/${{ inputs.nova_source }} \
+            -b ${{ inputs.nova_branch }} \
+            SukiSU-Nova
+          if [ -n "${{ inputs.nova_ref }}" ]; then
+            git -C SukiSU-Nova fetch --depth 1 origin ${{ inputs.nova_ref }}
+            git -C SukiSU-Nova checkout ${{ inputs.nova_ref }}
+          fi
+          echo "NOVA_DIR=$GITHUB_WORKSPACE/SukiSU-Nova/kernel" >> $GITHUB_ENV
+
+      # ---------- 2. 下载内核源码 ----------
+      - name: 克隆内核源码
+        run: |
+          git clone --depth 1 \
+            ${{ inputs.kernel_source_url }} \
+            -b ${{ inputs.kernel_source_branch }} \
+            kernel-src
+          KROOT="$GITHUB_WORKSPACE/kernel-src"
+          if [ -n "${{ inputs.kernel_source_dir }}" ]; then
+            KROOT="$KROOT/${{ inputs.kernel_source_dir }}"
+            [ -f "$KROOT/Makefile" ] || { echo "::error::子目录 ${{ inputs.kernel_source_dir }} 下未找到 Makefile"; exit 1; }
+          fi
+          echo "KROOT=$KROOT" >> $GITHUB_ENV
+
+      # ---------- 3. 集成 Nova 到内核源码 ----------
+      - name: 集成 SukiSU Nova
+        run: |
+          bash scripts/ksu-integrate.sh
+        env:
+          KERNEL_DIR: ${{ env.KROOT }}
+          NOVA_DIR: ${{ env.NOVA_DIR }}
+          NOVA_BRANCH: ${{ inputs.nova_branch }}
+
+      # ---------- 4. 定位 defconfig ----------
+      - name: 定位 defconfig
+        run: |
+          # 具体校验/搜索在 scripts/build-kernel.sh 里做（支持 gki/ vendor/ 子目录
+          # 和自定义 defconfig_path），这里只把名字传下去
+          echo "DEFCONFIG=${{ inputs.defconfig }}" >> $GITHUB_ENV
+
+      # ---------- 5. 工具链 ----------
+      - name: 下载 Clang
+        run: |
+          set -e
+          # ZyCromerZ/Clang：GitHub release 托管的完整 clang 工具链（内核社区常用）
+          # 注意 asset 名 ≠ tag 名：tag 是 "15.0.7-20260208-release"，
+          # 而文件是 "Clang-15.0.7-20260208.tar.gz"（去掉 -release）。
+          # 所以不靠拼字符串，直接问 API 拿真实下载地址，最稳。
+          VER="${{ inputs.toolchain_clang }}"
+          if [ -z "$VER" ]; then
+            VER="15.0.7-20260208-release"
+          fi
+          echo "Clang release tag: $VER"
+          API="https://api.github.com/repos/ZyCromerZ/Clang/releases/tags/$VER"
+          URL=$(curl -sL --retry 3 "$API" \
+                | python3 -c "import json,sys; d=json.load(sys.stdin); a=d.get('assets') or []; print(a[0]['browser_download_url'] if a else '')")
+          if [ -z "$URL" ]; then
+            echo "::error::无法从 $API 解析下载地址（tag 是否存在？）"
+            curl -sL "$API" | head -5
+            exit 1
+          fi
+          echo "下载: $URL"
+          wget -q --show-progress "$URL" -O clang.tar.gz
+          mkdir -p clang && tar -xzf clang.tar.gz -C clang --strip-components=1
+          test -x clang/bin/clang || { echo "::error::clang 解压后未找到 bin/clang"; ls clang | head; exit 1; }
+          clang/bin/clang --version | head -1
+          echo "CLANG_DIR=$GITHUB_WORKSPACE/clang" >> $GITHUB_ENV
+
+      - name: 下载 GCC 交叉编译器
+        if: ${{ inputs.use_gcc }}
+        run: |
+          set -e
+          rm -rf gcc
+          git clone --depth 1 "${{ inputs.gcc_url }}" gcc
+          # LineageOS 预编译包目录结构是 bin/ 直接在根下
+          if [ -x gcc/bin/aarch64-linux-gnu-gcc ]; then
+            echo "[+] GCC: $(gcc/bin/aarch64-linux-gnu-gcc --version | head -1)"
+          else
+            echo "::warning::未找到 gcc/bin/aarch64-linux-gnu-gcc，bin 目录："
+            ls gcc/ | head
+          fi
+          echo "GCC_DIR=$GITHUB_WORKSPACE/gcc" >> $GITHUB_ENV
+
+      # ---------- 6. 编译 ----------
+      - name: 编译内核
+        run: |
+          bash scripts/build-kernel.sh
+        env:
+          KROOT: ${{ env.KROOT }}
+          DEFCONFIG: ${{ env.DEFCONFIG }}
+          DEFCONFIG_PATH: ${{ inputs.defconfig_path }}
+          CLANG_DIR: ${{ env.CLANG_DIR }}
+          USE_GCC: ${{ inputs.use_gcc }}
+          GCC_DIR: ${{ env.GCC_DIR }}
+          KSU_AS_MODULE: ${{ inputs.ksu_as_module }}
+          ENABLE_KPM: ${{ inputs.enable_kpm }}
+          EXTRA_DEFCONFIG: ${{ inputs.extra_defconfig }}
+          PACK_ANYKERNEL: ${{ inputs.pack_anykernel }}
+          ANYKERNEL_REPO: ${{ inputs.anykernel_repo }}
+
+      # ---------- 7. 上传产物 ----------
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ github.run_id }}
+          path: out/
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: 发布 Release
+        if: ${{ inputs.release_tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: out/*
+          generate_release_notes: true

@@ -1,0 +1,19 @@
+# 构建产物 / 缓存
+out/
+*.o
+*.ko
+*.zip
+*.img
+*.tar.gz
+clang/
+gcc/
+AnyKernel3/
+kernel-src/
+SukiSU-Nova/
+prebuilts-clang/
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
+.idea/
+.vscode/
