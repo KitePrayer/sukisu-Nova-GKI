@@ -124,31 +124,45 @@ esac
 # 厂商开源仓库常把私有代码目录放成空壳（或干脆不提交），但 Kconfig 里
 # 仍有无条件 source。例如 realme GT5_GT5240W 的 init/Kconfig:874 引用了
 #   source "kernel/oplus_cpu/sched/Kconfig"
-# 而 kernel/oplus_cpu/sched/ 并不在开源仓库里，于是 make gki_defconfig 直接失败：
-#   init/Kconfig:874: can't open file "kernel/oplus_cpu/sched/Kconfig"
-# 这里扫描所有 Kconfig 里的 source 语句，路径不存在的就注释掉。
-# 注意：用 find 而不是 grep -r --include（busybox grep 不支持 --include）
+# 而 kernel/oplus_cpu/sched/ 并不在开源仓库里，于是 make gki_defconfig 直接失败。
+# 这里扫描所有 Kconfig 的 source 语句，路径不存在的注释掉。
+# 注意两点（都踩过）：
+#   1. 用 find 而不是 grep -r --include（busybox grep 无 --include）
+#   2. set -e 下循环体最后一条命令必须返回 0，否则整个脚本被杀，
+#      所以判断一律写成显式 if，不要用 [ ] || [ ] && continue
 echo "[+] 检查断裂的 Kconfig source 引用"
 BROKEN=0
-: > /tmp/_ksu_src_list.txt
-find . -type f -name 'Kconfig*' -print 2>/dev/null | while IFS= read -r f; do
-    grep -n '^[[:space:]]*source[[:space:]]*"' "$f" 2>/dev/null | \
-        while IFS= read -r kv; do
-            ln=${kv%%:*}
-            printf '%s\t%s\n' "$f" "$ln"
-        done
-done > /tmp/_ksu_src_list.txt
+LIST=/tmp/_ksu_src_list.txt
+: > "$LIST"
+while IFS= read -r f; do
+    grep -n '^[[:space:]]*source[[:space:]]*"' "$f" 2>/dev/null >> "$LIST.k" || true
+    # 给每行加上文件名前缀
+    if [ -s "$LIST.k" ]; then
+        sed "s|^|$f	|" "$LIST.k" >> "$LIST"
+        : > "$LIST.k"
+    fi
+done < <(find . -type f -name 'Kconfig*' -print 2>/dev/null)
+rm -f "$LIST.k"
 
-while IFS="$(printf '\t')" read -r kfile kline; do
-    [ -z "$kfile" ] || [ -z "$kline" ] && continue
+while IFS="$(printf '\t')" read -r kfile kline_rest; do
+    if [ -z "$kfile" ]; then
+        continue
+    fi
+    kline=${kline_rest%%:*}
+    if [ -z "$kline" ]; then
+        continue
+    fi
     src=$(sed -n "${kline}p" "$kfile" 2>/dev/null \
           | sed -n 's/.*source[[:space:]]*"\([^"]*\)".*/\1/p')
-    if [ -n "$src" ] && [ ! -e "$src" ]; then
+    if [ -z "$src" ]; then
+        continue
+    fi
+    if [ ! -e "$src" ]; then
         echo "  [!] $kfile:$kline 引用不存在的 $src，注释掉"
         sed -i "${kline}s|^|# [missing in vendor source] |" "$kfile"
         BROKEN=$((BROKEN+1))
     fi
-done < /tmp/_ksu_src_list.txt
+done < "$LIST"
 echo "[+] 断裂 Kconfig 引用处理完毕（共 $BROKEN 处）"
 
 echo "[+] 使用 defconfig: $DEFPATH"
