@@ -179,12 +179,14 @@ timeout 600 make "$DEFBASE"
 echo "[+] .config 已生成"
 
 # ---------- 2. 追加 SukiSU Nova 配置 ----------
-# 重要顺序（踩过坑）：
-#   1. 先 make olddefconfig 让 Kconfig 自己把所有符号按依赖关系填好
-#   2. 再用 scripts/config 逐个改我们关心的项
-#   3. 最后再 olddefconfig 一次，让依赖关系重新收敛
-# 如果反过来（先写再 olddefconfig），olddefconfig 会按依赖把
-# 不满足条件的项直接丢掉，例如 CONFIG_KSU 依赖 KPROBES/EXT4_FS 没满足时被抹掉。
+# 重要顺序（踩过两次坑，已用 kconfiglib 实测确认）：
+#   1. 先 make olddefconfig 让 Kconfig 把所有符号按依赖关系填好
+#   2. 再用 scripts/config 逐个写入我们关心的值
+#   3. 写完直接编译，绝不再跑 olddefconfig
+# 反例 A（先写再 olddefconfig）：olddefconfig 按依赖把不满足条件的项丢掉
+# 反例 B（写后再 olddefconfig）：它会按 Kconfig 的 default 重置我们写的值，
+#        实测 `--module KSU` 写成的 =m 会被立刻打回 =y，
+#        CONFIG_KPM（default n）会被清成 is not set。
 KSU_MODE=$([ "$KSU_AS_MODULE" = "true" ] && echo m || echo y)
 
 # 分支差异检测：main 分支 KSU 是 tristate（可 =m），builtin 是 bool（只能 y）
@@ -224,18 +226,32 @@ if [ ! -x scripts/config ]; then
     make -s scripts >/dev/null 2>&1 || true
 fi
 KCONF="./scripts/config"
+echo "[+] pwd=$(pwd)"
+echo "[+] KCONF=$KCONF  存在=$([ -x "$KCONF" ] && echo yes || echo no)"
+echo "[+] .config 行数=$(wc -l < .config 2>/dev/null || echo 0)"
+echo "[+] .config 里改之前的 KSU/KPM："
+grep -E '^CONFIG_KSU|^# CONFIG_KSU|^CONFIG_KPM|^# CONFIG_KPM' .config 2>/dev/null | head -5 || echo "    <无>"
 if [ ! -x "$KCONF" ]; then
     echo "::error::scripts/config 不可用，无法安全修改 .config"
     exit 1
 fi
 
 kconf() {
-    # $1=操作(--enable/--disable/--set-val) $2=符号名（不带 CONFIG_ 前缀，脚本会自动加）
+    # $1=操作(--enable/--disable/--set-val) $2=符号名（不带 CONFIG_ 前缀）
     local op="$1" sym="$2" val="${3:-}"
     case "$op" in
         --set-val) "$KCONF" --set-val "$sym" "$val" ;;
         *)         "$KCONF" "$op" "$sym" ;;
     esac
+    local rc=$?
+    # 每次改完立刻回读，任何一步没写上都能在日志里定位
+    local after
+    after=$(grep -E "^CONFIG_${sym}=" .config 2>/dev/null | head -1)
+    if [ -z "$after" ]; then
+        after=$(grep -E "^# CONFIG_${sym} is not set" .config 2>/dev/null | head -1)
+    fi
+    echo "    [config] ${op} ${sym}${val:+=$val} -> rc=$rc 现为: ${after:-<无此行>}"
+    return $rc
 }
 
 # ---------- 2.1 CONFIG_HZ ----------
@@ -324,24 +340,46 @@ if [ -n "${EXTRA_DEFCONFIG:-}" ]; then
 fi
 
 # ---------- 2.7 收敛 ----------
-echo "[+] 第 2 次 olddefconfig（依赖收敛）"
-if ! { set +o pipefail; yes "" | make olddefconfig > /tmp/_olddef2.log 2>&1; }; then
-    echo "::error::第二次 olddefconfig 失败"
-    tail -20 /tmp/_olddef2.log
-    exit 1
+# 千万不要在这里再跑 olddefconfig！
+# 已实测：olddefconfig 会按 Kconfig 的 default 重置我们用 scripts/config
+# 强行写入的值。例如 Nova 的 `config KSU ... default y`，
+# --module KSU 写成 =m 后，再 olddefconfig 立刻被打回 =y；
+# 同理 CONFIG_KPM（default n）会被清成 is not set。
+# 正确顺序是：olddefconfig 建基线（上面第 1 次）-> scripts/config 写值 -> 直接编译。
+echo "[+] 配置已写入，跳过第二次 olddefconfig（它会重置上面写入的值）"
+
+# 只做一次轻量校验：所有 .config 里的值语法合法，且关键项还在
+if grep -qE '^CONFIG_KSU=.$' .config; then
+    :
+else
+    echo "::warning::CONFIG_KSU 行格式异常"
 fi
-tail -3 /tmp/_olddef2.log
 
 echo "==================== 最终内核配置 ===================="
-for k in CONFIG_KSU CONFIG_KPROBES CONFIG_EXT4_FS CONFIG_KPM \
+for k in CONFIG_MODULES CONFIG_KSU CONFIG_KPROBES CONFIG_EXT4_FS CONFIG_KPM \
          CONFIG_HZ CONFIG_LTO_CLANG_THIN CONFIG_LTO_CLANG_FULL \
          CONFIG_CFI_CLANG CONFIG_DEBUG_INFO_BTF CONFIG_MODULE_SIG; do
     v=$(grep -E "^${k}=" .config 2>/dev/null | head -1 || true)
     if [ -z "$v" ]; then
         v=$(grep -E "^# ${k} is not set" .config 2>/dev/null | head -1 || true)
     fi
-    printf '  %-32s %s\n' "$k" "${v:-<缺失>}"
+    echo "  ${k} = ${v:-<缺失>}"
 done
+# 同时写进 Step Summary，GitHub 页面上能直接看到，不会被日志折叠
+{
+    echo "## 内核配置"
+    echo ""
+    echo "| 项 | 值 |"
+    echo "|---|---|"
+    for k in CONFIG_MODULES CONFIG_KSU CONFIG_KPM CONFIG_HZ CONFIG_LTO_CLANG_THIN \
+             CONFIG_CFI_CLANG CONFIG_DEBUG_INFO_BTF; do
+        v=$(grep -E "^${k}=" .config 2>/dev/null | head -1 | cut -d= -f2- || true)
+        if [ -z "$v" ]; then
+            v=$(grep -qE "^# ${k} is not set" .config 2>/dev/null && echo "n" || echo "缺失")
+        fi
+        echo "| $k | $v |"
+    done
+} >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
 # KSU 必须真的进了 .config，否则编出来是普通内核
 if ! grep -qE '^CONFIG_KSU=[ym]' .config; then
