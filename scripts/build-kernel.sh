@@ -120,6 +120,37 @@ case "$DEFCONFIG" in
        echo "         kbuild 用 make %config 规则匹配，如 foo_defconfig"
        exit 1 ;;
 esac
+# ---------- 1.5 修补仓库自带的断裂 Kconfig 引用 ----------
+# 厂商开源仓库常把私有代码目录放成空壳（或干脆不提交），但 Kconfig 里
+# 仍有无条件 source。例如 realme GT5_GT5240W 的 init/Kconfig:874 引用了
+#   source "kernel/oplus_cpu/sched/Kconfig"
+# 而 kernel/oplus_cpu/sched/ 并不在开源仓库里，于是 make gki_defconfig 直接失败：
+#   init/Kconfig:874: can't open file "kernel/oplus_cpu/sched/Kconfig"
+# 这里扫描所有 Kconfig 里的 source 语句，路径不存在的就注释掉。
+# 注意：用 find 而不是 grep -r --include（busybox grep 不支持 --include）
+echo "[+] 检查断裂的 Kconfig source 引用"
+BROKEN=0
+: > /tmp/_ksu_src_list.txt
+find . -type f -name 'Kconfig*' -print 2>/dev/null | while IFS= read -r f; do
+    grep -n '^[[:space:]]*source[[:space:]]*"' "$f" 2>/dev/null | \
+        while IFS= read -r kv; do
+            ln=${kv%%:*}
+            printf '%s\t%s\n' "$f" "$ln"
+        done
+done > /tmp/_ksu_src_list.txt
+
+while IFS="$(printf '\t')" read -r kfile kline; do
+    [ -z "$kfile" ] || [ -z "$kline" ] && continue
+    src=$(sed -n "${kline}p" "$kfile" 2>/dev/null \
+          | sed -n 's/.*source[[:space:]]*"\([^"]*\)".*/\1/p')
+    if [ -n "$src" ] && [ ! -e "$src" ]; then
+        echo "  [!] $kfile:$kline 引用不存在的 $src，注释掉"
+        sed -i "${kline}s|^|# [missing in vendor source] |" "$kfile"
+        BROKEN=$((BROKEN+1))
+    fi
+done < /tmp/_ksu_src_list.txt
+echo "[+] 断裂 Kconfig 引用处理完毕（共 $BROKEN 处）"
+
 echo "[+] 使用 defconfig: $DEFPATH"
 # kbuild 要求 defconfig 在 arch/$ARCH/configs 下才能用 make <name>，
 # 用户自定义路径时把他的文件复制成标准名字再 make
