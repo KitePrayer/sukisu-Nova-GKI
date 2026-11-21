@@ -185,13 +185,27 @@ jobs:
             apt-cache show "$pkg" >/dev/null 2>&1 && sudo apt-get install -y "$pkg" || true
           done
 
-          # 最终实测：能不能找到 libxml2.so.2
-          echo "----- libxml2 检查 -----"
-          if ldconfig -p 2>/dev/null | grep -q 'libxml2.so.2'; then
-            echo "[+] 系统已有 libxml2.so.2"
-            ldconfig -p | grep 'libxml2.so.2' | head -2
+          # 最终实测 + 兼容处理。
+          # Ubuntu 26.04 的 libxml2 是 ABI 16，文件名是 libxml2.so.16，
+          # 而 ZyCromerZ 的 ld.lld 链接时按 libxml2.so.2 查找，两者对不上。
+          # 建一个兼容软链即可（libxml2 的 2.x ABI 在常见符号上向后兼容）。
+          echo "----- libxml2 检查与兼容处理 -----"
+          if ! ldconfig -p 2>/dev/null | grep -q 'libxml2\.so\.2'; then
+            REAL=$(ldconfig -p 2>/dev/null | grep -oE '/[^ ]*libxml2\.so\.[0-9]+' | head -1)
+            if [ -z "$REAL" ]; then
+              REAL=$(find /usr/lib /lib -name 'libxml2.so.*' -type f 2>/dev/null | head -1)
+            fi
+            if [ -n "$REAL" ]; then
+              echo "[i] 找到 $REAL，建立 libxml2.so.2 兼容软链"
+              sudo ln -sf "$REAL" /usr/lib/x86_64-linux-gnu/libxml2.so.2 2>/dev/null || \
+                sudo ln -sf "$REAL" /usr/lib/libxml2.so.2 2>/dev/null || true
+              sudo ldconfig || true
+              ldconfig -p | grep 'libxml2' | head -3
+            else
+              echo "::warning::系统里完全没有 libxml2 运行时库"
+            fi
           else
-            echo "[!] 系统仍缺 libxml2.so.2，将依赖 clang 包自带的 lib/"
+            echo "[+] 系统已有 libxml2.so.2"
           fi
 
       - name: 配置 ccache
