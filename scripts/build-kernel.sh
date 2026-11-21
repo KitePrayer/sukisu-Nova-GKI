@@ -81,6 +81,8 @@ fi
 #   CONFIG_DEBUG_INFO_BTF=y  要 pahole 与 clang 版本配套，失败会中断编译
 # 所以在这里显式处理，而不是等 make 跑到一半 OOM 再猜。
 echo "==================== GKI 编译预检 ===================="
+# 默认目标：Image。若把 KernelSU 编成模块（CONFIG_KSU=m），
+# 只编 Image 不会产出 kernelsu.ko，必须一起编 modules。
 MAKE_GOALS="${MAKE_GOALS:-Image}"
 echo "MAKE_GOALS = $MAKE_GOALS"
 
@@ -192,6 +194,16 @@ if [ "$KSU_MODE" = "m" ] && [ -f "$KROOT/KernelSU/Kconfig" ]; then
         KSU_MODE=y
     fi
 fi
+
+# CONFIG_KSU=m 时追加 modules 目标，否则 kernelsu.ko 不会产出
+if [ "$KSU_MODE" = "m" ]; then
+    case "$MAKE_GOALS" in
+        *modules*) : ;;
+        *) MAKE_GOALS="$MAKE_GOALS modules modules_prepare" ;;
+    esac
+    echo "[+] KSU 编为模块，MAKE_GOALS 追加 modules"
+fi
+echo "[+] 最终 MAKE_GOALS = $MAKE_GOALS"
 
 echo "[+] 第 1 次 olddefconfig（建立依赖基线）"
 # 注意 pipefail：`yes "" | make` 中 yes 会收到 SIGPIPE 而返回 141，
@@ -452,6 +464,20 @@ echo "[+] 镜像目录: $IMG_DIR"
 
 mkdir -p "$GITHUB_WORKSPACE/out"
 cp -v "$IMG_DIR"/Image* "$GITHUB_WORKSPACE/out/" || true
+
+# ---------- 4.1 收集 KernelSU 模块 ----------
+if [ "$KSU_MODE" = "m" ]; then
+    echo "[+] 查找 kernelsu.ko"
+    KSU_KO=$(find "$KROOT" -name 'kernelsu.ko' -type f 2>/dev/null | head -1)
+    if [ -n "$KSU_KO" ]; then
+        cp -v "$KSU_KO" "$GITHUB_WORKSPACE/out/kernelsu.ko"
+        echo "[+] kernelsu.ko 已收集（供 LKM 模式 insmod 或管理器集成）"
+    else
+        echo "::error::CONFIG_KSU=m 但没有产出 kernelsu.ko"
+        echo "        可能 modules 目标没编到，检查 MAKE_GOALS"
+        exit 1
+    fi
+fi
 
 # 内核版本标识
 KV=$(strings "$IMG_DIR/Image" | grep -m1 "Linux version" || true)
