@@ -20,7 +20,7 @@ KPM 模块支持）。
 2. 打开仓库 **Actions** 页 → 左侧 **Build Kernel (SukiSU Nova)** → **Run workflow**。
 3. 填写必填参数：
    - `kernel_source_url`：内核源码 git 地址（HTTPS，如 `https://github.com/xxx/android_kernel_xxx.git`）
-   - `kernel_source_branch`：分支 / tag / commit
+   - `kernel_source_branch`：分支 / tag / commit。**留空即可**，留空走仓库默认分支
    - `defconfig`：如 `gki_defconfig`、`vendor_defconfig`、`munch_defconfig`
 4. 点 **Run workflow**，等编译完成（GKI 内核约 15–40 分钟）。
 5. 到本次 run 的 **Artifacts** 下载产物：
@@ -35,7 +35,7 @@ KPM 模块支持）。
 | 参数 | 说明 |
 |---|---|
 | `kernel_source_url` | 源码 git 地址，**必须**以 `.git` 结尾或能被 `git clone` 直接使用 |
-| `kernel_source_branch` | 分支 / tag / commit 的任意一个 |
+| `kernel_source_branch` | 分支 / tag / commit 的任意一个。**留空 = 用仓库默认分支**（推荐）。填了但不存在时，工作流会先把该仓库所有分支和 tag 列出来再报错，不会只给你一个 exit 128 |
 | `kernel_source_dir` | 源码在仓库中的子目录（如 `kernel/`、`common/`；根目录留空） |
 | `defconfig` | defconfig 文件名，如 `gki_defconfig`。**必须以 `defconfig` 结尾**（kbuild 的 `make %config` 规则要求） |
 | `defconfig_path` | defconfig 目录，默认自动搜索 `arch/arm64/configs`、`.../gki/`、`.../vendor/`；也可填自定义目录（如 `arch/arm64/configs/vendor2`） |

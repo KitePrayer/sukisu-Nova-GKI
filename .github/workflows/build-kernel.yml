@@ -31,10 +31,10 @@ on:
         required: true
         type: string
       kernel_source_branch:
-        description: "源码分支/tag/commit (如 lineage-21, 12.1, abcd1234)"
-        required: true
+        description: "源码分支/tag/commit；留空 = 仓库默认分支（厂商仓库常只有 master，不要照抄 main）"
+        required: false
         type: string
-        default: "main"
+        default: ""
       kernel_source_dir:
         description: "内核源码在仓库中的子目录 (如 kernel/ 或 common/；根目录留空)"
         required: false
@@ -169,11 +169,68 @@ jobs:
 
       # ---------- 2. 下载内核源码 ----------
       - name: 克隆内核源码
+        env:
+          SRC_URL: ${{ inputs.kernel_source_url }}
+          SRC_REF: ${{ inputs.kernel_source_branch }}
         run: |
-          git clone --depth 1 \
-            ${{ inputs.kernel_source_url }} \
-            -b ${{ inputs.kernel_source_branch }} \
-            kernel-src
+          set -e
+          # 分支不存在时 git clone 会抛 exit 128，信息极少。先自己校验一遍，
+          # 把「仓库到底有哪些分支」直接打出来。
+          if [ -n "$SRC_REF" ]; then
+            echo "[+] 校验 ref: $SRC_REF"
+            if git ls-remote --exit-code --heads "$SRC_URL" "$SRC_REF" >/dev/null 2>&1; then
+              echo "[+] 分支存在: $SRC_REF"
+              CLONE_ARGS="--branch $SRC_REF"
+            elif git ls-remote --exit-code --tags "$SRC_URL" "$SRC_REF" >/dev/null 2>&1; then
+              echo "[+] tag 存在: $SRC_REF"
+              CLONE_ARGS="--branch $SRC_REF"
+            else
+              # 可能是 commit SHA：浅克隆拿不到，只能全量再切
+              if printf '%s' "$SRC_REF" | grep -qE '^[0-9a-f]{7,40}$'; then
+                echo "[+] 按 commit SHA 处理: $SRC_REF"
+                CLONE_ARGS=""
+              else
+                echo "::error::ref '$SRC_REF' 在该仓库中既不是分支也不是 tag"
+                echo "----- 该仓库现有分支 -----"
+                git ls-remote --heads "$SRC_URL" | sed 's#.*refs/heads/#  #' || true
+                echo "----- 该仓库现有 tag -----"
+                git ls-remote --tags "$SRC_URL" | sed 's#.*refs/tags/#  #' | head -20 || true
+                echo "::error::把 kernel_source_branch 改成上面列出的值，或留空用默认分支"
+                exit 1
+              fi
+            fi
+          else
+            echo "[+] 未指定分支，使用仓库默认分支"
+            CLONE_ARGS=""
+          fi
+
+          # GKI common 单 commit 就几个 GB，--single-branch 能省一次全分支枚举
+          git clone --depth 1 --single-branch $CLONE_ARGS "$SRC_URL" kernel-src
+          if [ -z "$CLONE_ARGS" ]; then
+            if [ -n "$SRC_REF" ]; then
+              # 走到这里说明 SRC_REF 是个 commit SHA。服务器可能拒绝（不存在、
+              # 或不是该分支上的 commit），直接抛 fatal 就回到原来那个谜之
+              # 错误了，所以包一层，自己把话说清楚。
+              if ! git -C kernel-src fetch --depth 1 origin "$SRC_REF" 2>/dev/null; then
+                echo "::error::commit '$SRC_REF' 无法获取"
+                echo "  可能原因："
+                echo "   1. 该 commit 不存在于 $SRC_URL"
+                echo "   2. 服务器设置了 uploadpack.allowReachableSHA1InWant=false，"
+                echo "      浅克隆拿不到任意 commit（GitHub 就是这样）"
+                echo "   3. SHA 写短了（只写前 7 位在浅克隆下基本必失败）"
+                echo "----- 该仓库现有分支 -----"
+                git ls-remote --heads "$SRC_URL" | sed 's#.*refs/heads/#  #' || true
+                echo "::error::改用完整 SHA、或改填分支/tag，或留空用默认分支"
+                exit 1
+              fi
+              if ! git -C kernel-src checkout --detach "$SRC_REF" 2>/dev/null; then
+                echo "::error::已 fetch 到 $SRC_REF 但 checkout 失败"
+                exit 1
+              fi
+            fi
+          fi
+          echo "[+] 检出版本: $(git -C kernel-src rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
           KROOT="$GITHUB_WORKSPACE/kernel-src"
           if [ -n "${{ inputs.kernel_source_dir }}" ]; then
             KROOT="$KROOT/${{ inputs.kernel_source_dir }}"
