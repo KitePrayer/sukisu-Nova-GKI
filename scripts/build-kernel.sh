@@ -66,6 +66,21 @@ else
     fi
 fi
 
+# ---------- 0.5 GKI 编译预检 ----------
+# 这个内核的 gki_defconfig 里同时开了：
+#   CONFIG_LTO_CLANG_FULL=y  FULL LTO 在 GitHub runner(7~16G 内存) 上基本 OOM
+#   CONFIG_CFI_CLANG=y       紧跟 LTO，关 LTO 必须一起关，否则链接期报错
+#   CONFIG_DEBUG_INFO_BTF=y  要 pahole 与 clang 版本配套，失败会中断编译
+# 所以在这里显式处理，而不是等 make 跑到一半 OOM 再猜。
+echo "==================== GKI 编译预检 ===================="
+MAKE_GOALS="${MAKE_GOALS:-Image}"
+echo "MAKE_GOALS = $MAKE_GOALS"
+
+# 内存
+MEM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+echo "可用内存: ${MEM_MB} MB"
+JOBS=$(nproc)
+
 # ---------- 1. 生成 .config ----------
 # defconfig 位置优先级：用户指定的 defconfig_path > 常见默认目录
 DEFPATH=""
@@ -141,6 +156,49 @@ if [ "$ENABLE_KPM" = "true" ]; then
     fi
 fi
 
+# ---------- 2.5 GKI 三大编译门槛 ----------
+# LTO：FULL LTO 是整内核单模块优化，内存需求是 THIN 的数倍。
+#       runner 上 7G 内存必 OOM，所以默认降到 thin；THIN 也吃紧时再关掉。
+# CFI：依赖 LTO，关 LTO 必须同时关 CFI，否则链接期 "CFI requires LTO"。
+LTO_MODE="${LTO_MODE:-thin}"
+echo "[+] LTO 模式: $LTO_MODE"
+case "$LTO_MODE" in
+    full)
+        set_conf CONFIG_LTO_CLANG_FULL y
+        set_conf CONFIG_LTO_CLANG_THIN n
+        ;;
+    thin)
+        set_conf CONFIG_LTO_CLANG_FULL n
+        set_conf CONFIG_LTO_CLANG_THIN y
+        ;;
+    none)
+        set_conf CONFIG_LTO_CLANG_FULL n
+        set_conf CONFIG_LTO_CLANG_THIN n
+        set_conf CONFIG_LTO_NONE y
+        # 关 LTO 就必须关 CFI，否则链接期直接报错
+        set_conf CONFIG_CFI_CLANG n
+        echo "[!] 已关闭 LTO，同时关闭 CONFIG_CFI_CLANG（CFI 依赖 LTO）"
+        ;;
+esac
+
+# BTF：CONFIG_DEBUG_INFO_BTF 需要 pahole 与当前 clang 产物兼容。
+#      GitHub runner 的 pahole 版本经常与内核要求不匹配，导致 vmlinux 生成失败。
+#      默认关闭：这不影响内核启动，只影响 BTF 调试信息与 BPF CO-RE。
+BTF_MODE="${BTF_MODE:-off}"
+if [ "$BTF_MODE" = "on" ]; then
+    echo "[+] 保留 CONFIG_DEBUG_INFO_BTF=y"
+    command -v pahole >/dev/null 2>&1 && pahole --version || echo "::warning::未找到 pahole"
+else
+    set_conf CONFIG_DEBUG_INFO_BTF n
+    set_conf CONFIG_DEBUG_INFO_BTF_MODULES n 2>/dev/null || true
+    echo "[+] 已关闭 CONFIG_DEBUG_INFO_BTF（避免 pahole 版本不匹配中断编译）"
+fi
+
+# GKI ABI 强制检查：会在 KSU 加了符号后直接失败，编译阶段关掉。
+# 注意这只影响编译期校验，不影响产出的 KMI 本身。
+set_conf CONFIG_MODULE_SIG n 2>/dev/null || true
+echo "[+] 已关闭 CONFIG_MODULE_SIG（自编内核无签名链）"
+
 # 用户自定义 extra 配置（支持真换行或字面 \n）
 if [ -n "${EXTRA_DEFCONFIG:-}" ]; then
     echo "[+] 追加 extra_defconfig:"
@@ -185,15 +243,27 @@ if [ "$USE_GCC" = "true" ] && [ -n "$GCC_DIR" ]; then
     fi
 fi
 
-echo "==================== 开始编译 (Image) ===================="
+echo "==================== 开始编译 ($MAKE_GOALS) ===================="
+# 按内存自适应并发：内核编译单 job 峰值约 1.5~2G（LTO 更高）。
+# 直接 -j$(nproc) 在 16 核/16G runner 上仍有 OOM 风险，按内存压一下。
+MEM_JOBS=$(( MEM_MB / 2000 ))
+[ "$MEM_JOBS" -lt 1 ] && MEM_JOBS=1
+[ "$MEM_JOBS" -gt "$JOBS" ] && MEM_JOBS=$JOBS
+echo "[+] 并发: $MEM_JOBS (nproc=$JOBS, mem=${MEM_MB}MB)"
+
 # 注意：这里临时关掉 pipefail/set -e，否则 make 失败会立即退出，
 # 导致下面的错误日志打印不出来（用户只能看到空失败）
 set +e
-make -j"$(nproc)" Image 2>&1 | tee /tmp/kernel-build.log
+# shellcheck disable=SC2086
+make -j"$MEM_JOBS" $MAKE_GOALS 2>&1 | tee /tmp/kernel-build.log
 BUILD_RC=${PIPESTATUS[0]}
 set -e
 if [ "$BUILD_RC" -ne 0 ]; then
-    echo "::error::内核编译失败（退出码 $BUILD_RC），最后 60 行日志："
+    echo "::error::内核编译失败（退出码 $BUILD_RC）"
+    echo "----- 错误摘要 -----"
+    grep -nE 'error:|Error [0-9]|fatal error|undefined reference|Killed|out of memory|cannot find' \
+        /tmp/kernel-build.log | tail -25 || true
+    echo "----- 最后 60 行 -----"
     tail -60 /tmp/kernel-build.log
     exit "$BUILD_RC"
 fi
