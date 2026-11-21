@@ -173,114 +173,172 @@ if [ "$DEFPATH" != "arch/arm64/configs/$DEFBASE" ]; then
     cp "$DEFPATH" "arch/arm64/configs/$DEFBASE"
     echo "[+] 已复制到 arch/arm64/configs/$DEFBASE 供 kbuild 使用"
 fi
-timeout 600 make "$DEFBASE" </dev/null
+timeout 600 make "$DEFBASE"
 echo "[+] .config 已生成"
 
 # ---------- 2. 追加 SukiSU Nova 配置 ----------
-# main 分支 = kprobe 方案（推荐内置，也支持模块）
-# builtin 分支 = 手动 hook 方案（必须内置 CONFIG_KSU=y）
+# 重要顺序（踩过坑）：
+#   1. 先 make olddefconfig 让 Kconfig 自己把所有符号按依赖关系填好
+#   2. 再用 scripts/config 逐个改我们关心的项
+#   3. 最后再 olddefconfig 一次，让依赖关系重新收敛
+# 如果反过来（先写再 olddefconfig），olddefconfig 会按依赖把
+# 不满足条件的项直接丢掉，例如 CONFIG_KSU 依赖 KPROBES/EXT4_FS 没满足时被抹掉。
 KSU_MODE=$([ "$KSU_AS_MODULE" = "true" ] && echo m || echo y)
 
-# 分支差异检测：main 分支的 KSU 是 tristate（可 =m），builtin 分支是 bool（只能 y）
+# 分支差异检测：main 分支 KSU 是 tristate（可 =m），builtin 是 bool（只能 y）
 if [ "$KSU_MODE" = "m" ] && [ -f "$KROOT/KernelSU/Kconfig" ]; then
-    if sed -n '/^config KSU$/,/^\S/p' "$KROOT/KernelSU/Kconfig" | grep -q '^\s*bool'; then
-        echo "::warning::当前 Nova 分支的 CONFIG_KSU 是 bool，无法编成模块；"
-        echo "           ksu_as_module=true 会被 kbuild 规整为内置 y。"
-        echo "           若确实要 LKM 模式，请用 nova_branch=main。"
+    if sed -n '/^config KSU$/,/^\S/p' "$KROOT/KernelSU/Kconfig" | grep -q '^[[:space:]]*bool'; then
+        echo "::warning::当前 Nova 分支的 CONFIG_KSU 是 bool，无法编成模块，将按内置 y 处理"
+        KSU_MODE=y
     fi
 fi
 
-# 写配置项：先删掉 .config 里同名旧行，避免重复项（kbuild 虽然后者生效，
-# 但重复行会让 `grep` 检查产生误导，也不符合 .config 规范）
-set_conf() {
-    local key="$1" val="$2"
-    sed -i "/^${key}=/d; /^# ${key} is not set/d" .config
-    echo "${key}=${val}" >> .config
+echo "[+] 第 1 次 olddefconfig（建立依赖基线）"
+# 注意 pipefail：`yes "" | make` 中 yes 会收到 SIGPIPE 而返回 141，
+# 整条管道就算失败。所以先落到文件再看 make 的真实退出码。
+if ! { set +o pipefail; yes "" | make olddefconfig > /tmp/_olddef1.log 2>&1; }; then
+    echo "::error::make olddefconfig 失败"
+    tail -20 /tmp/_olddef1.log
+    exit 1
+fi
+tail -3 /tmp/_olddef1.log
+
+# 统一的配置写入函数：
+# 用 scripts/config 而不是直接 sed .config，因为它能正确处理
+# 「# CONFIG_X is not set」形式，也不会写出重复行。
+# scripts/config 是内核自带脚本，必须存在
+if [ ! -x scripts/config ]; then
+    echo "[!] scripts/config 不存在，现场编译"
+    make -s scripts >/dev/null 2>&1 || true
+fi
+KCONF="./scripts/config"
+if [ ! -x "$KCONF" ]; then
+    echo "::error::scripts/config 不可用，无法安全修改 .config"
+    exit 1
+fi
+
+kconf() {
+    # $1=操作(--enable/--disable/--set-val) $2=符号名（不带 CONFIG_ 前缀，脚本会自动加）
+    local op="$1" sym="$2" val="${3:-}"
+    case "$op" in
+        --set-val) "$KCONF" --set-val "$sym" "$val" ;;
+        *)         "$KCONF" "$op" "$sym" ;;
+    esac
 }
 
-set_conf CONFIG_KSU "$KSU_MODE"
-set_conf CONFIG_KPROBES y
-set_conf CONFIG_EXT4_FS y
+# ---------- 2.1 CONFIG_HZ ----------
+# 必须显式设置。内核生成 include/generated/timeconst.h 用：
+#     filechk_gentimeconst = echo $(CONFIG_HZ) | bc -q kernel/time/timeconst.bc
+# CONFIG_HZ 为空时 `echo | bc` 拿到空输入，bc 报 "bad expression"，
+# filechk 因输出不匹配而反复重试，表现为 prepare 阶段无限挂起。
+# 已用真实 timeconst.bc 实测：250 正常产出，空值报错。
+if ! grep -q '^CONFIG_HZ=' .config; then
+    echo "[+] 补充 CONFIG_HZ=250（原 defconfig 未定义，会导致 timeconst 生成挂起）"
+fi
+# 只需设 HZ 的值，HZ_250/HZ_100 由 arch Kconfig 的 choice 自动推导，
+# 手动 enable HZ_250 反而可能与 HZ 冲突
+kconf --set-val HZ 250
+
+# ---------- 2.2 KernelSU ----------
+kconf --enable KPROBES
+kconf --enable EXT4_FS
+if [ "$KSU_MODE" = "m" ]; then
+    kconf --module KSU
+else
+    kconf --enable KSU
+fi
+
 if [ "$ENABLE_KPM" = "true" ]; then
-    set_conf CONFIG_KPM y
+    kconf --enable KPM
     if [ "$KSU_MODE" = "y" ]; then
-        set_conf CONFIG_KALLSYMS y
-        set_conf CONFIG_KALLSYMS_ALL y
+        kconf --enable KALLSYMS
+        kconf --enable KALLSYMS_ALL
     fi
 fi
 
-# ---------- 2.5 GKI 三大编译门槛 ----------
-# LTO：FULL LTO 是整内核单模块优化，内存需求是 THIN 的数倍。
-#       runner 上 7G 内存必 OOM，所以默认降到 thin；THIN 也吃紧时再关掉。
-# CFI：依赖 LTO，关 LTO 必须同时关 CFI，否则链接期 "CFI requires LTO"。
+# ---------- 2.3 LTO / CFI ----------
+# FULL LTO 在 4 核 16G runner 上极易 OOM，默认 thin
 LTO_MODE="${LTO_MODE:-thin}"
 echo "[+] LTO 模式: $LTO_MODE"
 case "$LTO_MODE" in
     full)
-        set_conf CONFIG_LTO_CLANG_FULL y
-        set_conf CONFIG_LTO_CLANG_THIN n
+        kconf --enable LTO_CLANG_FULL
+        kconf --disable LTO_CLANG_THIN
         ;;
     thin)
-        set_conf CONFIG_LTO_CLANG_FULL n
-        set_conf CONFIG_LTO_CLANG_THIN y
+        kconf --disable LTO_CLANG_FULL
+        kconf --enable LTO_CLANG_THIN
         ;;
     none)
-        set_conf CONFIG_LTO_CLANG_FULL n
-        set_conf CONFIG_LTO_CLANG_THIN n
-        set_conf CONFIG_LTO_NONE y
-        # 关 LTO 就必须关 CFI，否则链接期直接报错
-        set_conf CONFIG_CFI_CLANG n
-        echo "[!] 已关闭 LTO，同时关闭 CONFIG_CFI_CLANG（CFI 依赖 LTO）"
+        kconf --disable LTO_CLANG_FULL
+        kconf --disable LTO_CLANG_THIN
+        kconf --disable CFI_CLANG
+        echo "[!] 已关闭 LTO，同时关闭 CFI_CLANG（CFI 依赖 LTO）"
         ;;
 esac
 
-# BTF：CONFIG_DEBUG_INFO_BTF 需要 pahole 与当前 clang 产物兼容。
-#      GitHub runner 的 pahole 版本经常与内核要求不匹配，导致 vmlinux 生成失败。
-#      默认关闭：这不影响内核启动，只影响 BTF 调试信息与 BPF CO-RE。
+# ---------- 2.4 BTF ----------
 BTF_MODE="${BTF_MODE:-off}"
 if [ "$BTF_MODE" = "on" ]; then
-    echo "[+] 保留 CONFIG_DEBUG_INFO_BTF=y"
+    echo "[+] 保留 DEBUG_INFO_BTF"
     command -v pahole >/dev/null 2>&1 && pahole --version || echo "::warning::未找到 pahole"
 else
-    set_conf CONFIG_DEBUG_INFO_BTF n
-    set_conf CONFIG_DEBUG_INFO_BTF_MODULES n 2>/dev/null || true
-    echo "[+] 已关闭 CONFIG_DEBUG_INFO_BTF（避免 pahole 版本不匹配中断编译）"
+    kconf --disable DEBUG_INFO_BTF
+    kconf --disable DEBUG_INFO_BTF_MODULES
+    echo "[+] 已关闭 DEBUG_INFO_BTF（避免 pahole 版本不匹配中断编译）"
 fi
 
-# GKI ABI 强制检查：会在 KSU 加了符号后直接失败，编译阶段关掉。
-# 注意这只影响编译期校验，不影响产出的 KMI 本身。
-set_conf CONFIG_MODULE_SIG n 2>/dev/null || true
-echo "[+] 已关闭 CONFIG_MODULE_SIG（自编内核无签名链）"
+# ---------- 2.5 模块签名 ----------
+kconf --disable MODULE_SIG
+echo "[+] 已关闭 MODULE_SIG（自编内核无签名链）"
 
-# 用户自定义 extra 配置（支持真换行或字面 \n）
+# ---------- 2.6 用户自定义 ----------
 if [ -n "${EXTRA_DEFCONFIG:-}" ]; then
     echo "[+] 追加 extra_defconfig:"
-    : > .config.new
     echo -e "$EXTRA_DEFCONFIG" | while IFS= read -r line; do
-        [ -z "$line" ] && continue
+        if [ -z "$line" ]; then continue; fi
         case "$line" in \#*) continue ;; esac
-        printf '%s\n' "$line" >> .config.new
+        echo "    $line"
+        sym=$(printf '%s' "$line" | sed -n 's/^CONFIG_\([A-Za-z0-9_]*\)=.*/\1/p')
+        val=$(printf '%s' "$line" | sed -n 's/^CONFIG_[A-Za-z0-9_]*=\(.*\)/\1/p')
+        if [ -z "$sym" ]; then continue; fi
+        case "$val" in
+            y) "$KCONF" --enable  "$sym" ;;
+            m) "$KCONF" --module  "$sym" ;;
+            n) "$KCONF" --disable "$sym" ;;
+            *) "$KCONF" --set-val "$sym" "$val" ;;
+        esac
     done
-    if [ -s .config.new ]; then
-        cat .config.new >> .config
-        sed 's/^/    /' .config.new
-    fi
-    rm -f .config.new
 fi
 
-# 让新增的 CONFIG_ 生效。
-# 绝对不能落到 `make oldconfig`：它会对每个新符号交互式提问，CI 里 stdin
-# 不是 /dev/null 时会一直等输入，表现为「编译跑了一小时没输出、也不失败」。
-# 全部 make 都显式 </dev/null，杜绝任何交互等待。
-echo "[+] 解析 .config（olddefconfig，非交互）"
-if ! make olddefconfig </dev/null 2>&1 | tail -5; then
-    echo "::error::make olddefconfig 失败"
+# ---------- 2.7 收敛 ----------
+echo "[+] 第 2 次 olddefconfig（依赖收敛）"
+if ! { set +o pipefail; yes "" | make olddefconfig > /tmp/_olddef2.log 2>&1; }; then
+    echo "::error::第二次 olddefconfig 失败"
+    tail -20 /tmp/_olddef2.log
     exit 1
 fi
-echo "[+] .config 解析完成"
+tail -3 /tmp/_olddef2.log
 
-echo "==================== 最终内核配置（KSU 相关） ===================="
-grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPM" .config || true
+echo "==================== 最终内核配置 ===================="
+for k in CONFIG_KSU CONFIG_KPROBES CONFIG_EXT4_FS CONFIG_KPM \
+         CONFIG_HZ CONFIG_LTO_CLANG_THIN CONFIG_LTO_CLANG_FULL \
+         CONFIG_CFI_CLANG CONFIG_DEBUG_INFO_BTF CONFIG_MODULE_SIG; do
+    v=$(grep -E "^${k}=" .config 2>/dev/null | head -1 || true)
+    if [ -z "$v" ]; then
+        v=$(grep -E "^# ${k} is not set" .config 2>/dev/null | head -1 || true)
+    fi
+    printf '  %-32s %s\n' "$k" "${v:-<缺失>}"
+done
+
+# KSU 必须真的进了 .config，否则编出来是普通内核
+if ! grep -qE '^CONFIG_KSU=[ym]' .config; then
+    echo "::error::CONFIG_KSU 没有生效，编译出来不会是 KernelSU 内核"
+    echo "        可能原因：库目录没有正确接入（drivers/kernelsu）"
+    echo "        检查 drivers/Kconfig 是否 source 了 kernelsu"
+    grep -n 'kernelsu' drivers/Kconfig drivers/Makefile 2>/dev/null || echo "        未找到 kernelsu 引用！"
+    exit 1
+fi
 
 # ---------- 3. 编译 ----------
 CROSS_ARGS=()
@@ -314,7 +372,7 @@ echo "==================== 编译阶段 1/2: prepare ===================="
 # 先单独跑 prepare。这一步会暴露 Kconfig/工具链层面的问题，
 # 几秒内就能结束，不会像整编那样一跑一小时什么都看不见。
 set +e
-timeout 900 make -j"${MEM_JOBS:-4}" prepare </dev/null 2>&1 | tee /tmp/kernel-prepare.log | tail -20
+timeout 1800 make -j"${MEM_JOBS:-4}" prepare 2>&1 | tee /tmp/kernel-prepare.log | tail -20
 RC=${PIPESTATUS[0]}
 set -e
 if [ "$RC" -ne 0 ]; then
@@ -329,24 +387,36 @@ echo "==================== 编译阶段 2/2: $MAKE_GOALS ===================="
 # 这样即使 make 卡住，日志里也能看出「停在哪个时间点」。
 # 之前跑了 68 分钟无任何输出，就是因为没有这个。
 START_TS=$(date +%s)
-( while true; do
-    sleep 60
+# 心跳用「有限次数 + 短 sleep」而不是 while true + sleep 60：
+# kill 子 shell 杀不掉它内部的 sleep，会让 CI 步骤在脚本结束后仍挂住。
+# 这里改成最多 130 次、每次 55 秒（约 2 小时），并用子 shell 的 PGID 兜底清理。
+(
+  i=0
+  while [ "$i" -lt 130 ]; do
+    sleep 55
+    i=$((i+1))
     if [ -f /tmp/kernel-build.log ]; then
-        printf '[heartbeat] 已编译 %d 分钟，日志 %d 行，最后一条: %s\n' \
-          "$(( $(date +%s) - START_TS ))" \
-          "$(wc -l < /tmp/kernel-build.log 2>/dev/null || echo 0)" \
-          "$(tail -1 /tmp/kernel-build.log 2>/dev/null | cut -c1-100)"
+      printf '[heartbeat] 已编译 %d 分钟，日志 %d 行，最后一条: %s\n' \
+        "$(( $(date +%s) - START_TS ))" \
+        "$(wc -l < /tmp/kernel-build.log 2>/dev/null || echo 0)" \
+        "$(tail -1 /tmp/kernel-build.log 2>/dev/null | cut -c1-100 || true)"
     fi
-  done ) &
+  done
+) &
 HB_PID=$!
 
 set +e
 # timeout 兜底：120 分钟还没完说明卡死了，直接杀并打印现场
 # shellcheck disable=SC2086
-timeout 7200 make -j"$MEM_JOBS" $MAKE_GOALS </dev/null 2>&1 | tee /tmp/kernel-build.log
+timeout 7200 make -j"$MEM_JOBS" $MAKE_GOALS 2>&1 | tee /tmp/kernel-build.log
 BUILD_RC=${PIPESTATUS[0]}
 set -e
-kill "$HB_PID" 2>/dev/null || true
+if [ -n "${HB_PID:-}" ]; then
+    kill -TERM "$HB_PID" 2>/dev/null || true
+    # 兜底：连带它的子进程（sleep）一起收掉，否则 CI 步骤结束后仍会挂住
+    pkill -TERM -P "$HB_PID" 2>/dev/null || true
+    wait "$HB_PID" 2>/dev/null || true
+fi
 
 if [ "$BUILD_RC" -ne 0 ]; then
     echo "::error::内核编译失败（退出码 $BUILD_RC）"
@@ -365,8 +435,8 @@ echo "[+] 编译完成，用时 $(( $(date +%s) - START_TS )) 秒"
 
 # 尝试生成压缩镜像（可选，不阻塞）
 echo "[+] 尝试生成 Image.gz / Image.lz4 ..."
-timeout 600 make -j"$(nproc)" Image.gz </dev/null >/dev/null 2>&1 || true
-if command -v lz4 >/dev/null 2>&1; then timeout 600 make -j"$(nproc)" Image.lz4 </dev/null >/dev/null 2>&1 || true; fi
+timeout 600 make -j"$(nproc)" Image.gz >/dev/null 2>&1 || true
+if command -v lz4 >/dev/null 2>&1; then timeout 600 make -j"$(nproc)" Image.lz4 >/dev/null 2>&1 || true; fi
 
 # ---------- 4. 定位与收集产物 ----------
 IMG_DIR=""
@@ -392,21 +462,25 @@ if [ "$PACK_ANYKERNEL" = "true" ]; then
     echo "[+] 打包 AnyKernel3 ..."
     AK_DIR="$GITHUB_WORKSPACE/AnyKernel3"
     rm -rf "$AK_DIR"
-    if ! git clone --depth 1 "$ANYKERNEL_REPO" "$AK_DIR" 2>/dev/null; then
+    if git clone --depth 1 "$ANYKERNEL_REPO" "$AK_DIR" 2>/dev/null; then
+        rm -rf "$AK_DIR/.git"
+        cp "$IMG_DIR/Image" "$AK_DIR/Image"
+        for ext in lz4 gz xz; do
+            if [ -f "$IMG_DIR/Image.$ext" ]; then
+                cp "$IMG_DIR/Image.$ext" "$AK_DIR/Image.$ext"
+            fi
+        done
+        KVER=$(cat "$GITHUB_WORKSPACE/out/kernel-version.txt" 2>/dev/null \
+               | sed -E 's/Linux version ([^ ]+) .*/\1/' || true)
+        ZIP_NAME="AnyKernel3-${KVER:-kernel}.zip"
+        if (cd "$AK_DIR" && zip -q -r9 "$GITHUB_WORKSPACE/out/$ZIP_NAME" .); then
+            echo "[+] AnyKernel3 打包完成: $ZIP_NAME"
+        else
+            echo "::warning::zip 打包失败，保留 Image"
+        fi
+    else
         echo "::warning::AnyKernel3 克隆失败，跳过刷机包（仍保留 Image）"
-        exit 0
     fi
-    rm -rf "$AK_DIR/.git"
-    # Image* 一律放根目录，AnyKernel3 的 anykernel.sh 会按需取用
-    # （gki-2.0 分支模板已适配 Image.lz4 / Image.gz）
-    cp "$IMG_DIR/Image" "$AK_DIR/Image"
-    [ -f "$IMG_DIR/Image.lz4" ] && cp "$IMG_DIR/Image.lz4" "$AK_DIR/Image.lz4"
-    [ -f "$IMG_DIR/Image.gz" ] && cp "$IMG_DIR/Image.gz" "$AK_DIR/Image.gz"
-    [ -f "$IMG_DIR/Image.xz" ] && cp "$IMG_DIR/Image.xz" "$AK_DIR/Image.xz"
-    # 生成刷机包
-    ZIP_NAME="AnyKernel3-$(cat "$GITHUB_WORKSPACE/out/kernel-version.txt" 2>/dev/null | sed -E 's/Linux version ([^ ]+) .*/\1/' || echo kernel).zip"
-    (cd "$AK_DIR" && zip -q -r9 "$GITHUB_WORKSPACE/out/$ZIP_NAME" .)
-    echo "[+] AnyKernel3 打包完成: $ZIP_NAME"
 fi
 
 echo "==================== 构建完成 ===================="
